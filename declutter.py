@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""declutter.py — Organize files by type and date, deduplicating by content.
+
+Scans one or more input folders and builds a clean tree:
+
+  Media/Photos/YYYY/MM/photo.jpg   (EXIF date if available, else mtime)
+  Media/Videos/YYYY/MM/video.mp4
+  Files/<ext>/file.<ext>
+  Files/other/<source>/<relative_path>/...   (unrecognized types)
+  Duplicates/<source>/<relative_path>/...    (extra copies, kept for review)
+  duplicates_report.csv
+
+Duplicates are detected by CONTENT (size -> partial SHA-256 -> full SHA-256),
+never by name. Nothing is ever deleted: files are copied by default and extra
+copies are set aside in Duplicates/ for manual review.
+
+No required dependencies. With Pillow installed, photos are dated from EXIF;
+with pillow-heif, HEIC/HEIF (iPhone) files are too.
+
+Recommended usage:
+  1) python3 declutter.py -i /path/to/messy -o /path/to/organized --dry-run --report /tmp/report.csv
+  2) review the report and the simulation
+  3) python3 declutter.py -i /path/to/messy -o /path/to/organized --move --clean-empty-dirs
+"""
+
+import argparse
+import csv
+import errno
+import hashlib
+import os
+import shutil
+import sys
+from collections import defaultdict
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# TYPE CONFIGURATION — edit to taste
+# ---------------------------------------------------------------------------
+
+PHOTO_EXTS = {
+    "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp",
+    "heic", "heif", "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2",
+}
+
+VIDEO_EXTS = {
+    "mp4", "mov", "avi", "mkv", "m4v", "wmv", "flv", "webm",
+    "mts", "m2ts", "3gp", "mpg", "mpeg",
+}
+
+FILE_EXTS = {
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods",
+    "txt", "rtf", "csv",
+    "zip", "rar", "7z", "tar", "gz",
+    "mp3", "flac", "m4a", "wav", "ogg",
+    "epub", "mobi",
+}
+
+# System folders (NAS devices, Windows), skipped by exact name.
+# Anything starting with "." is already skipped as hidden.
+EXCLUDED_DIRS = {
+    "@Recycle", "@Recently-Snapshot", "@Transcode",   # QNAP
+    "@eaDir", "#recycle",                             # Synology
+    "$RECYCLE.BIN", "System Volume Information",      # Windows
+}
+
+CHUNK = 1024 * 1024          # bytes per read when hashing
+PARTIAL_BYTES = 64 * 1024    # bytes hashed in the partial pass
+
+# ---------------------------------------------------------------------------
+# DATES
+# ---------------------------------------------------------------------------
+
+try:
+    from PIL import Image  # optional
+    _PIL_OK = True
+    try:
+        from pillow_heif import register_heif_opener  # optional HEIC/HEIF support
+        register_heif_opener()
+        _HEIF_OK = True
+    except Exception:
+        _HEIF_OK = False
+except ImportError:
+    _PIL_OK = False
+    _HEIF_OK = False
+
+_IFD_EXIF = 0x8769           # Exif sub-IFD
+_TAG_DT_ORIGINAL = 36867     # DateTimeOriginal (lives in the sub-IFD)
+_TAG_DT_DIGITIZED = 36868    # DateTimeDigitized (idem)
+_TAG_DT = 306                # DateTime (IFD0)
+
+
+def exif_date(path):
+    """EXIF date of an image, or None. DateTimeOriginal lives in the Exif
+    sub-IFD, which getexif() does not include, so it is queried explicitly."""
+    if not _PIL_OK:
+        return None
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if not exif:
+                return None
+            candidates = []
+            if hasattr(exif, "get_ifd"):
+                try:
+                    sub = exif.get_ifd(_IFD_EXIF)
+                    candidates += [sub.get(_TAG_DT_ORIGINAL), sub.get(_TAG_DT_DIGITIZED)]
+                except Exception:
+                    pass
+            # Fallbacks: IFD0 DateTime, plus flattened IFDs on some Pillow versions
+            candidates += [exif.get(_TAG_DT), exif.get(_TAG_DT_ORIGINAL), exif.get(_TAG_DT_DIGITIZED)]
+            for val in candidates:
+                if not val:
+                    continue
+                try:
+                    return datetime.strptime(str(val)[:19], "%Y:%m:%d %H:%M:%S")
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def file_date(path, is_photo):
+    """Date used for sorting: EXIF for photos when available, else mtime."""
+    if is_photo:
+        dt = exif_date(path)
+        if dt:
+            return dt
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path))
+    except (OSError, OverflowError, ValueError):
+        # Corrupt mtimes land in 1970/01: an easy-to-spot review bucket
+        return datetime(1970, 1, 1)
+
+
+def _safe_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+# ---------------------------------------------------------------------------
+# HASHING (3-phase dedup)
+# ---------------------------------------------------------------------------
+
+def partial_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(PARTIAL_BYTES))
+    return h.hexdigest()
+
+
+def full_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+# ---------------------------------------------------------------------------
+# PATH VALIDATION
+# ---------------------------------------------------------------------------
+
+def _is_within(child, parent):
+    try:
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:
+        return False
+
+
+def validate_paths(inputs, output):
+    """Reject overlapping input/output (each run would re-ingest its own
+    output) and drop repeated or nested inputs (their files would be flagged
+    as duplicates of themselves)."""
+    cleaned = []
+    for r in inputs:
+        rp = os.path.realpath(r)
+        if not os.path.isdir(rp):
+            print("WARNING: input folder does not exist, skipping: %s" % r, file=sys.stderr)
+            continue
+        cleaned.append(rp)
+
+    final = []
+    for r in sorted(set(cleaned), key=len):
+        if any(_is_within(r, prev) for prev in final):
+            print("WARNING: '%s' is inside another input; skipping it to avoid processing it twice." % r)
+            continue
+        final.append(r)
+
+    if not final:
+        print("ERROR: no valid input folder.", file=sys.stderr)
+        sys.exit(2)
+
+    output_root = os.path.realpath(output)
+    if os.path.exists(output_root) and not os.path.isdir(output_root):
+        print("ERROR: output exists and is not a folder: %s" % output_root, file=sys.stderr)
+        sys.exit(2)
+    for r in final:
+        if _is_within(output_root, r) or _is_within(r, output_root):
+            print("ERROR: input and output overlap:\n  input:  %s\n  output: %s\n"
+                  "Running like this re-ingests the output and multiplies files. "
+                  "Use an output folder outside the inputs." % (r, output_root), file=sys.stderr)
+            sys.exit(2)
+
+    return final, output_root
+
+# ---------------------------------------------------------------------------
+# CLASSIFICATION AND DESTINATIONS
+# ---------------------------------------------------------------------------
+
+def dest_for(path, input_root, output_root):
+    """Destination path based on file type and date."""
+    name = os.path.basename(path)
+    ext = os.path.splitext(name)[1].lstrip(".").lower()
+
+    if ext in PHOTO_EXTS:
+        dt = file_date(path, is_photo=True)
+        return os.path.join(output_root, "Media", "Photos",
+                            "%04d" % dt.year, "%02d" % dt.month, name)
+    if ext in VIDEO_EXTS:
+        dt = file_date(path, is_photo=False)
+        return os.path.join(output_root, "Media", "Videos",
+                            "%04d" % dt.year, "%02d" % dt.month, name)
+    if ext in FILE_EXTS:
+        return os.path.join(output_root, "Files", ext, name)
+
+    # Unrecognized type -> Files/other/<source>/<relative_path>/
+    rel_dir = os.path.relpath(os.path.dirname(path), input_root)
+    if rel_dir == ".":
+        rel_dir = ""
+    source = os.path.basename(os.path.normpath(input_root))
+    return os.path.join(output_root, "Files", "other", source, rel_dir, name)
+
+
+def unique_path(dest, reserved):
+    """Append _1, _2... while dest is taken on disk OR already assigned in
+    this run; 'reserved' lets dry-run simulate renames like the real run."""
+    base, ext = os.path.splitext(dest)
+    candidate = dest
+    i = 1
+    while os.path.exists(candidate) or candidate in reserved:
+        candidate = "%s_%d%s" % (base, i, ext)
+        i += 1
+    reserved.add(candidate)
+    return candidate
+
+# ---------------------------------------------------------------------------
+# SCANNING
+# ---------------------------------------------------------------------------
+
+def scan_files(inputs, warnings):
+    """Return a list of (path, input_root) for every regular file."""
+    files = []
+    seen = set()
+
+    def _dir_error(e):
+        warnings["unreadable_dirs"] += 1
+        print("WARNING: could not list folder %s (%s)"
+              % (getattr(e, "filename", "?"), e), file=sys.stderr)
+
+    for root in inputs:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_dir_error):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d not in EXCLUDED_DIRS]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                full = os.path.join(dirpath, fn)
+                # Moving a symlink could leave a broken link in the output
+                if os.path.islink(full):
+                    warnings["symlinks"] += 1
+                    continue
+                # FIFOs/sockets/devices would hang the hashing step
+                if not os.path.isfile(full):
+                    warnings["special"] += 1
+                    continue
+                rp = os.path.realpath(full)
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                files.append((full, root))
+    return files
+
+# ---------------------------------------------------------------------------
+# DEDUPLICATION
+# ---------------------------------------------------------------------------
+
+def _record_dupes(matches, h, originals, duplicates):
+    """Keep the oldest copy as the original; the rest become duplicates."""
+    matches.sort(key=lambda t: _safe_mtime(t[0]))
+    originals.append(matches[0] + (h,))
+    for dup in matches[1:]:
+        duplicates.append((dup[0], dup[1], matches[0][0], h))
+
+
+def find_duplicates(files, warnings):
+    """
+    Phase 1: group by size (unique sizes need no hashing).
+    Phase 2: within each group, hash the first 64 KiB.
+    Phase 3: within each subgroup, full SHA-256.
+    """
+    by_size = defaultdict(list)
+    for path, root in files:
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            warnings["unreadable"] += 1
+            print("WARNING: could not read %s (%s)" % (path, e), file=sys.stderr)
+            continue
+        by_size[size].append((path, root))
+
+    originals = []
+    duplicates = []
+    total_groups = sum(1 for g in by_size.values() if len(g) > 1)
+    processed = 0
+
+    for size, group in by_size.items():
+        if len(group) == 1:
+            originals.append(group[0] + (None,))
+            continue
+
+        processed += 1
+        if processed % 100 == 0:
+            print("  ... analyzing candidate group %d/%d"
+                  % (processed, total_groups), flush=True)
+
+        # Phase 2: partial hash
+        by_partial = defaultdict(list)
+        for path, root in group:
+            try:
+                by_partial[partial_hash(path)].append((path, root))
+            except OSError as e:
+                warnings["unreadable"] += 1
+                print("WARNING: could not read %s (%s)" % (path, e), file=sys.stderr)
+
+        for hp, subgroup in by_partial.items():
+            if len(subgroup) == 1:
+                originals.append(subgroup[0] + (None,))
+                continue
+            # A file that fits in the partial read is already fully hashed
+            if size <= PARTIAL_BYTES:
+                _record_dupes(subgroup, hp, originals, duplicates)
+                continue
+            # Phase 3: full hash
+            by_hash = defaultdict(list)
+            for path, root in subgroup:
+                try:
+                    by_hash[full_hash(path)].append((path, root))
+                except OSError as e:
+                    warnings["unreadable"] += 1
+                    print("WARNING: could not read %s (%s)" % (path, e), file=sys.stderr)
+            for h, matches in by_hash.items():
+                if len(matches) == 1:
+                    originals.append(matches[0] + (h,))
+                else:
+                    _record_dupes(matches, h, originals, duplicates)
+
+    return originals, duplicates
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+def _abort_disk_full():
+    print("\nFATAL: destination disk is FULL (ENOSPC). Stopping now instead of "
+          "failing file by file for hours.\nFree some space and re-run the same "
+          "command: the script resumes where it left off without duplicating anything.",
+          file=sys.stderr)
+    sys.exit(3)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Organize files by type/date and detect real duplicates (by content).")
+    ap.add_argument("-i", "--input", action="append", required=True,
+                    help="Input folder (repeatable)")
+    ap.add_argument("-o", "--output", required=True, help="Output root folder")
+    ap.add_argument("--move", action="store_true", help="Move instead of copy")
+    ap.add_argument("--dry-run", action="store_true", help="Simulate: touch nothing")
+    ap.add_argument("--skip-duplicates", action="store_true",
+                    help="Do not relocate duplicates to Duplicates/, only record them in the CSV")
+    ap.add_argument("--report", default=None,
+                    help="CSV report path (with --dry-run, also writes the report)")
+    ap.add_argument("--clean-empty-dirs", action="store_true",
+                    help="With --move: remove folders left empty in the inputs")
+    ap.add_argument("--skip-space-check", action="store_true",
+                    help="Do not abort even if the destination seems short on space")
+    args = ap.parse_args()
+
+    # Odd filenames must not crash console output on strict-encoding terminals
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+    inputs, output_root = validate_paths(args.input, args.output)
+    report_path = os.path.realpath(args.report) if args.report else os.path.join(output_root, "duplicates_report.csv")
+    action = shutil.move if args.move else shutil.copy2
+    verb = "MOVE" if args.move else "COPY"
+
+    if not _PIL_OK:
+        print("NOTE: Pillow is not installed; photos will be dated by modification")
+        print("      time instead of EXIF. For EXIF support: pip3 install Pillow\n")
+    elif not _HEIF_OK:
+        print("NOTE: without pillow-heif, HEIC/HEIF files are dated by mtime.\n")
+
+    warnings = defaultdict(int)
+
+    print("Scanning input folders...", flush=True)
+    files = scan_files(inputs, warnings)
+    print("  %d files found." % len(files))
+
+    print("Looking for duplicates by content (SHA-256, 3 phases)...", flush=True)
+    originals, duplicates = find_duplicates(files, warnings)
+    print("  %d unique files, %d real duplicates.\n" % (len(originals), len(duplicates)))
+
+    # Space check before touching anything (copy mode only)
+    if not args.move and not args.dry_run and not args.skip_space_check:
+        needed = 0
+        for path, _root, _h in originals:
+            try:
+                needed += os.path.getsize(path)
+            except OSError:
+                pass
+        if not args.skip_duplicates:
+            for dup, _r, _o, _h in duplicates:
+                try:
+                    needed += os.path.getsize(dup)
+                except OSError:
+                    pass
+        try:
+            os.makedirs(output_root, exist_ok=True)
+            free = shutil.disk_usage(output_root).free
+        except OSError:
+            free = None
+        if free is not None and free < needed * 1.02:
+            print("ERROR: not enough space at destination: ~%.1f GiB needed, %.1f GiB free.\n"
+                  "       Options: use --move (no copying within the same volume), free up\n"
+                  "       space, or force with --skip-space-check at your own risk."
+                  % (needed / 2.0 ** 30, free / 2.0 ** 30), file=sys.stderr)
+            sys.exit(2)
+
+    # --- Place originals ---
+    errors = 0
+    reserved = set()   # destinations already assigned in this run
+    dest_map = {}      # original -> final destination (for the report)
+    count = 0
+    for path, root, h in originals:
+        count += 1
+        if count % 1000 == 0:
+            print("  ... processing %d/%d" % (count, len(originals)), flush=True)
+
+        dest = dest_for(path, root, output_root)
+        if os.path.exists(dest):
+            # Same content already at the destination? (makes re-runs resumable)
+            try:
+                if os.path.getsize(dest) == os.path.getsize(path):
+                    h_src = h or full_hash(path)
+                    if full_hash(dest) == h_src:
+                        duplicates.append((path, root, dest, h_src))
+                        continue
+            except OSError:
+                pass
+        dest = unique_path(dest, reserved)
+        dest_map[path] = dest
+
+        if args.dry_run:
+            print("[DRY-RUN] %s: %s -> %s" % (verb, path, dest))
+        else:
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                action(path, dest)
+            except (OSError, shutil.Error) as e:
+                if getattr(e, "errno", None) == errno.ENOSPC:
+                    _abort_disk_full()
+                errors += 1
+                dest_map.pop(path, None)
+                print("ERROR with %s: %s" % (path, e), file=sys.stderr)
+
+    # --- CSV report ---
+    write_report = (not args.dry_run) or bool(args.report)
+    if write_report:
+        os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        # backslashreplace: non-UTF8 filenames must not break the report
+        with open(report_path, "w", newline="", encoding="utf-8", errors="backslashreplace") as f:
+            w = csv.writer(f)
+            w.writerow(["duplicate", "kept_original", "original_destination", "sha256"])
+            for dup, root, orig, h in duplicates:
+                w.writerow([dup, orig, dest_map.get(orig, orig), h])
+    elif duplicates:
+        print("(dry-run: add --report /path/to/report.csv to dump the duplicate list)")
+
+    # --- Relocate duplicates ---
+    if not args.skip_duplicates:
+        for dup, root, orig, h in duplicates:
+            rel = os.path.relpath(dup, root)
+            dest = os.path.join(output_root, "Duplicates", os.path.basename(os.path.normpath(root)), rel)
+            if args.dry_run:
+                print("[DRY-RUN] duplicate: %s (== %s) -> %s" % (dup, orig, dest))
+            else:
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    action(dup, unique_path(dest, reserved))
+                except (OSError, shutil.Error) as e:
+                    if getattr(e, "errno", None) == errno.ENOSPC:
+                        _abort_disk_full()
+                    errors += 1
+                    print("ERROR with duplicate %s: %s" % (dup, e), file=sys.stderr)
+
+    # --- Remove empty folders after moving ---
+    if args.clean_empty_dirs and args.move and not args.dry_run:
+        removed = 0
+        for root in inputs:
+            for dirpath, _dirs, _files in os.walk(root, topdown=False):
+                if dirpath == root:
+                    continue
+                try:
+                    os.rmdir(dirpath)   # only removes empty dirs; otherwise fails and is ignored
+                    removed += 1
+                except OSError:
+                    pass
+        print("Empty folders removed from inputs: %d" % removed)
+
+    print("\n--- SUMMARY ---")
+    print("Unique files processed: %d" % len(originals))
+    print("Duplicates detected:    %d" % len(duplicates))
+    if warnings["symlinks"]:
+        print("Symlinks skipped:       %d" % warnings["symlinks"])
+    if warnings["special"]:
+        print("Special files skipped:  %d (FIFOs, sockets...)" % warnings["special"])
+    if warnings["unreadable"] or warnings["unreadable_dirs"]:
+        print("Unreadable (see warnings): %d files, %d folders"
+              % (warnings["unreadable"], warnings["unreadable_dirs"]))
+    if write_report:
+        print("Duplicates report:      %s" % report_path)
+    if errors:
+        print("Errors:                 %d (see messages above)" % errors)
+    if args.dry_run:
+        print("(Dry run: no files were touched)")
+
+    sys.exit(1 if errors else 0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted. You can re-run the same command: the script resumes "
+              "without duplicating anything.", file=sys.stderr)
+        sys.exit(130)
