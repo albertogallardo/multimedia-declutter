@@ -1,6 +1,6 @@
 # Declutter
 
-**Organize and deduplicate photos, videos and files — without ever deleting anything.**
+**Organize and deduplicate photos, videos, music, audio and files — without ever deleting anything.**
 
 `declutter.py` takes one or more messy folders and rebuilds their contents into a clean structure organized by type and date, detecting **real duplicates by content** (never by name). It is a single Python 3.6+ script with no required dependencies, and it runs anywhere: Linux, macOS, or a NAS over SSH.
 
@@ -23,10 +23,11 @@ By design it is **non-destructive**: it copies by default, sets duplicate copies
 | Component | Required? | Purpose |
 |---|---|---|
 | Python 3.6 or later | Yes | Run the script |
-| Pillow (`pip3 install Pillow`) | No | Date photos from EXIF (`DateTimeOriginal`). Without it, modification time is used |
+| Pillow (`pip3 install Pillow`) | No | Date photos from EXIF (`DateTimeOriginal`). Without it, the WhatsApp filename date or the modification time is used |
 | pillow-heif (`pip3 install pillow-heif`) | No | Read EXIF from HEIC/HEIF (iPhone) files too |
+| mutagen (`pip3 install mutagen`) | No | Classify music by artist/album from its tags. Without it, ALL audio goes to `Media/Audio/` by date. `pip` picks the right version for your Python (current mutagen needs ≥ 3.10; on 3.8/3.9 it resolves 1.47.x); only on 3.6/3.7 pin it by hand: `pip3 install mutagen==1.45.1` |
 
-The script tells you at startup if either optional package is missing and what that implies.
+The script tells you at startup if any of the optional packages is missing and what that implies.
 
 ---
 
@@ -55,10 +56,13 @@ Everything hangs from the folder given with `-o`:
 ```
 <output>/
 ├── Media/
-│   ├── Photos/YYYY/MM/photo.jpg        # EXIF date if available; else mtime
-│   └── Videos/YYYY/MM/video.mp4        # modification time
+│   ├── Photos/YYYY/MM/photo.jpg        # EXIF date; else WhatsApp filename date; else mtime
+│   ├── Videos/YYYY/MM/video.mp4        # WhatsApp filename date; else mtime
+│   ├── Music/<Artist>/<Album>/song.mp3 # audio WITH an artist tag (needs mutagen)
+│   │   └── <Artist>/song.mp3           # tagged with artist but no album
+│   └── Audio/YYYY/MM/voicenote.opus    # audio without tags: WhatsApp, voice notes…
 ├── Files/
-│   ├── pdf/…  docx/…  rar/…  mp3/…     # one folder per extension (flat)
+│   ├── pdf/…  docx/…  rar/…            # one folder per extension (flat)
 │   └── other/<input>/<relative_path>/file.xyz   # unrecognized types
 ├── Duplicates/<input>/<relative_path>/…          # extra copies, for review
 └── duplicates_report.csv               # (or the path given with --report)
@@ -74,9 +78,10 @@ Everything hangs from the folder given with `-o`:
 |---|---|
 | Photos | jpg, jpeg, png, gif, bmp, tif, tiff, webp, heic, heif, raw, cr2, cr3, nef, arw, dng, orf, rw2 |
 | Videos | mp4, mov, avi, mkv, m4v, wmv, flv, webm, mts, m2ts, 3gp, mpg, mpeg |
-| Files | pdf, doc, docx, xls, xlsx, ppt, pptx, odt, ods, txt, rtf, csv, zip, rar, 7z, tar, gz, mp3, flac, m4a, wav, ogg, epub, mobi |
+| Audio | mp3, flac, m4a, wav, ogg, oga, opus, aac, wma, aiff, aif, aifc, ape, amr |
+| Files | pdf, doc, docx, xls, xlsx, ppt, pptx, odt, ods, txt, rtf, csv, zip, rar, 7z, tar, gz, epub, mobi |
 
-Any other extension (or files without one) → `Files/other/…`.
+Any other extension (or files without one) → `Files/other/…`. Note that `m4b`/`m4r` (audiobooks, ringtones) are deliberately **not** listed as audio, so they never land in the music tree (see [§Customization](#customization) to add them).
 
 ### Always ignored
 
@@ -114,9 +119,40 @@ python3 declutter.py -i INPUT [-i INPUT2 …] -o OUTPUT [options]
 1. `DateTimeOriginal` from the Exif sub-IFD — the real capture date written by cameras and phones.
 2. `DateTimeDigitized` from the Exif sub-IFD.
 3. `DateTime` from IFD0.
-4. No readable EXIF → file modification time (mtime).
+4. No readable EXIF → WhatsApp filename date (see below), else file modification time (mtime).
 
-**Videos**: always mtime (video metadata is not read; see [§Known limitations](#known-limitations)).
+**Videos**: WhatsApp filename date, else mtime (video metadata is not read; see [§Known limitations](#known-limitations)).
+
+**Audio without tags**: WhatsApp filename date, else mtime.
+
+**WhatsApp filename date**: WhatsApp strips EXIF but encodes the real send date in the
+filename, so `IMG-`/`VID-`/`PTT-`/`AUD-YYYYMMDD-WA….ext` (phones) and desktop/web exports —
+whose prefix is localized: `WhatsApp Audio 2023-05-12 at ….ogg`, `Imagen de WhatsApp
+2023-05-12 a las ….jpeg`, `WhatsApp Bild 2023-05-12 um ….jpg`… — are dated from the name.
+A photo, a video and a voice note from the same chat land in the same `YYYY/MM` across all
+three branches. Names that merely look like the pattern but carry a date impossible in the
+calendar (month 13…) fall back to mtime; a genuinely future-dated name (a phone with a skewed
+clock) is filed under its named year — an easy-to-spot review bucket, and deterministic across
+re-runs.
+
+## How audio is classified
+
+The rule is literal: **any audio file with a readable artist tag goes to
+`Media/Music/<Artist>/<Album>/`** (album omitted when missing) — including tagged podcasts and
+audiobooks in `.mp3`/`.m4a`. Everything else — WhatsApp audio, voice notes, recordings, and any
+music without tags — goes to `Media/Audio/YYYY/MM/`.
+
+Notes:
+
+- Tag reading needs **mutagen** (optional). Without it, nothing is promoted to `Media/Music/`
+  and all audio is filed by date — the tree keeps the same shape either way.
+- `albumartist` is preferred over `artist`, so compilations stay together; an empty
+  `albumartist` falls through to `artist`.
+- Tag keys are looked up per container (easy keys, Vorbis comments, ASF/`WM/…` for WMA, raw ID3
+  frames for WAV/AIFF, APEv2), so tagged WMA/WAV/AIFF/APE libraries are classified too.
+- Artist/album folder names are sanitized to be valid on Windows/SMB/exFAT shares: illegal
+  characters (`<>:"|?*/\`) become `_`, names are capped at 80 chars, and Windows-reserved names
+  (`CON`, `NUL`…) get a trailing `_`.
 
 **Corrupt mtime** (impossible dates left behind by some filesystem or an old copy): the file is filed under `1970/01`, an easy-to-spot review bucket, instead of crashing the run.
 
@@ -159,6 +195,19 @@ The script is **resumable and idempotent**: if a file already exists at its dest
 - **Resuming or repeating with `--move`**: naturally clean — whatever was already moved is no longer in the input.
 - **Resuming or repeating in copy mode**: add `--skip-duplicates`. Otherwise everything already placed by the previous pass would count as a "duplicate of the destination" and be physically copied into `Duplicates/`, bloating it for no reason.
 - **Incremental passes** (feeding new folders into the same output over time): same advice — in copy mode use `--skip-duplicates`; with `--move` it's not needed.
+
+> ⚠️ **Upgrading from a version without audio support**: older versions placed mp3/flac/m4a/wav/ogg
+> under `Files/<ext>/` and every other now-recognized audio extension (opus, oga, aac, wma, aiff,
+> aif, aifc, ape, amr — including WhatsApp `.opus` voice notes) under `Files/other/<input>/…`.
+> This version computes audio destinations under `Media/Music/` or `Media/Audio/`, so it does
+> **not** recognize those files as already placed: resuming an old interrupted run (or an
+> incremental pass into an old output) re-places every audio file under `Media/` and leaves the
+> old copies behind. Either finish pending runs with the old script, or accept the re-placement
+> and then clean up by hand: `Files/{mp3,flac,m4a,wav,ogg}` plus the audio buried in
+> `Files/other/` (e.g. `find Files/other -name '*.opus'` — don't delete `Files/other/` wholesale,
+> it also holds genuinely unrecognized files that were NOT re-placed).
+> For the same reason, **don't install or remove mutagen between a run and its resume**: tagged
+> audio would flip between `Media/Audio/` and `Media/Music/` and be re-copied.
 
 ---
 
@@ -214,7 +263,7 @@ tail -f declutter.log
 
 At the top of the script there are a few blocks meant to be edited freely:
 
-- `PHOTO_EXTS`, `VIDEO_EXTS`, `FILE_EXTS`: add or remove extensions (lowercase, without the dot).
+- `PHOTO_EXTS`, `VIDEO_EXTS`, `AUDIO_EXTS`, `FILE_EXTS`: add or remove extensions (lowercase, without the dot). Adding `m4b`/`m4r` to `AUDIO_EXTS` classifies audiobooks/ringtones like any other audio (tagged ones will show up under `Media/Music/`).
 - `EXCLUDED_DIRS`: folders ignored by exact name.
 - `PARTIAL_BYTES` (64 KiB) and `CHUNK` (1 MiB): read sizes for the partial and full hash. The defaults work well; there's rarely a reason to touch them.
 
@@ -222,7 +271,10 @@ At the top of the script there are a few blocks meant to be edited freely:
 
 ## Known limitations
 
-- **Video dates**: always mtime (reading the real creation date would require dependencies like ffprobe/exiftool).
+- **Video dates**: mtime, except for WhatsApp-named files (reading the real creation date from video metadata would require dependencies like ffprobe/exiftool).
+- **Untagged music is indistinguishable from a voice note**: it is filed by date, so an untagged album can smear across several `YYYY/MM` folders (one per mtime). Tag your files first (e.g. with MusicBrainz Picard) if you want them under `Media/Music/`.
+- **Distinct artists can merge after sanitization**: `AC/DC` and `AC:DC` both become the folder `AC_DC` (files are never overwritten — collisions get `_1`, `_2`… suffixes).
+- **`.aac` (ADTS) always goes to `Media/Audio/`**: mutagen cannot read tags from raw ADTS streams.
 - **Hidden files**: not processed (by design; remove the leading dot if you want them organized).
 - `Files/<ext>/` is **flat**: all PDFs together, all DOCX together… (original paths are only preserved under `other/` and `Duplicates/`).
 - **Single-threaded hashing.** On HDDs the disk is the bottleneck, so it hardly matters; on SSDs a parallel approach would be faster.

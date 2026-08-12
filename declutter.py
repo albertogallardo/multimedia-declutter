@@ -4,8 +4,10 @@
 
 Scans one or more input folders and builds a clean tree:
 
-  Media/Photos/YYYY/MM/photo.jpg   (EXIF date if available, else mtime)
-  Media/Videos/YYYY/MM/video.mp4
+  Media/Photos/YYYY/MM/photo.jpg   (EXIF date, else WhatsApp filename date, else mtime)
+  Media/Videos/YYYY/MM/video.mp4   (WhatsApp filename date, else mtime)
+  Media/Music/Artist/Album/song.mp3          (audio with an artist tag, via mutagen)
+  Media/Audio/YYYY/MM/voicenote.opus         (audio without tags: voice notes, WhatsApp...)
   Files/<ext>/file.<ext>
   Files/other/<source>/<relative_path>/...   (unrecognized types)
   Duplicates/<source>/<relative_path>/...    (extra copies, kept for review)
@@ -16,7 +18,8 @@ never by name. Nothing is ever deleted: files are copied by default and extra
 copies are set aside in Duplicates/ for manual review.
 
 No required dependencies. With Pillow installed, photos are dated from EXIF;
-with pillow-heif, HEIC/HEIF (iPhone) files are too.
+with pillow-heif, HEIC/HEIF (iPhone) files are too. With mutagen, music is
+classified by artist/album; without it, all audio is filed by date.
 
 Recommended usage:
   1) python3 declutter.py -i /path/to/messy -o /path/to/organized --dry-run --report /tmp/report.csv
@@ -29,8 +32,10 @@ import csv
 import errno
 import hashlib
 import os
+import re
 import shutil
 import sys
+import unicodedata
 from collections import defaultdict
 from datetime import datetime
 
@@ -48,11 +53,17 @@ VIDEO_EXTS = {
     "mts", "m2ts", "3gp", "mpg", "mpeg",
 }
 
+# m4b/m4r (audiobooks, ringtones) are deliberately NOT audio so they never
+# land in Media/Music; add them here if you want them classified anyway.
+AUDIO_EXTS = {
+    "mp3", "flac", "m4a", "wav", "ogg", "oga", "opus",
+    "aac", "wma", "aiff", "aif", "aifc", "ape", "amr",
+}
+
 FILE_EXTS = {
     "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods",
     "txt", "rtf", "csv",
     "zip", "rar", "7z", "tar", "gz",
-    "mp3", "flac", "m4a", "wav", "ogg",
     "epub", "mobi",
 }
 
@@ -121,12 +132,47 @@ def exif_date(path):
     return None
 
 
+# WhatsApp names its files after the real send date (and strips EXIF), so the
+# filename beats mtime: IMG/VID/PTT/AUD-YYYYMMDD-WA0001.ext (phones) and
+# desktop/web exports, whose prefix is localized ("WhatsApp Audio 2023-05-12
+# at 10.23.11.ogg", "Imagen de WhatsApp 2023-05-12 a las...", "WhatsApp Bild
+# 2023-05-12 um...") — hence the loose second pattern.
+_WA_NAME_RES = (
+    (re.compile(r"^(?:IMG|VID|PTT|AUD)-(\d{8})-WA\d", re.IGNORECASE), "%Y%m%d"),
+    (re.compile(r"WhatsApp\D*?(\d{4}-\d{2}-\d{2})(?!\d)", re.IGNORECASE), "%Y-%m-%d"),
+)
+
+
+def _filename_date(name):
+    """Date encoded in a WhatsApp-style filename, or None. Strict: a renamed
+    file that merely matches the pattern (month 13...) must fall back to
+    mtime, never crash the run. The year bounds are fixed constants — a
+    destination must depend only on the file, never on today's clock, or
+    re-runs across New Year would re-place files."""
+    for rx, fmt in _WA_NAME_RES:
+        m = rx.search(name)
+        if not m:
+            continue
+        try:
+            dt = datetime.strptime(m.group(1), fmt)
+        except ValueError:
+            return None
+        if 2005 <= dt.year <= 2099:
+            return dt
+        return None
+    return None
+
+
 def file_date(path, is_photo):
-    """Date used for sorting: EXIF for photos when available, else mtime."""
+    """Date used for sorting: EXIF for photos when available, then WhatsApp
+    filename date, else mtime."""
     if is_photo:
         dt = exif_date(path)
         if dt:
             return dt
+    dt = _filename_date(os.path.basename(path))
+    if dt:
+        return dt
     try:
         return datetime.fromtimestamp(os.path.getmtime(path))
     except (OSError, OverflowError, ValueError):
@@ -139,6 +185,79 @@ def _safe_mtime(path):
         return os.path.getmtime(path)
     except OSError:
         return 0.0
+
+# ---------------------------------------------------------------------------
+# AUDIO TAGS (music vs loose audio)
+# ---------------------------------------------------------------------------
+
+try:
+    import mutagen  # optional: classify music by artist/album tags
+    _MUTAGEN_OK = True
+except ImportError:
+    _MUTAGEN_OK = False
+
+# Tag keys vary by container: easy keys for MP3/MP4, native Vorbis comments
+# for FLAC/Ogg/Opus, 'Author'/'WM/...' for WMA (ASF), raw ID3 frames for
+# WAV/AIFF, 'Album Artist' (with a space) for APE. Each field is therefore
+# looked up through a list of known keys, in preference order.
+_ARTIST_KEYS = ("albumartist", "Album Artist", "WM/AlbumArtist", "TPE2",
+                "artist", "Author", "TPE1")
+_ALBUM_KEYS = ("album", "WM/AlbumTitle", "TALB")
+
+# Characters invalid on Windows/SMB/exFAT (the output often lives on a NAS
+# share), plus control characters.
+_UNSAFE_CHARS = re.compile(r'[<>:"|?*/\\\x00-\x1f]')
+_WIN_RESERVED = ({"CON", "PRN", "AUX", "NUL"}
+                 | {"COM%d" % i for i in range(1, 10)}
+                 | {"LPT%d" % i for i in range(1, 10)})
+
+
+def _safe_component(value):
+    """Sanitize a tag value into a folder name valid on Windows/SMB/exFAT,
+    or None if nothing usable is left."""
+    s = unicodedata.normalize("NFC", str(value))  # NFC: one 'Beyoncé', not two
+    s = _UNSAFE_CHARS.sub("_", s)
+    # Cap first, strip after: truncation must not leave a trailing dot/space
+    # (rejected by SMB/Windows).
+    s = s[:80].strip(". ")
+    if not s:
+        return None
+    if s.upper() in _WIN_RESERVED:
+        s += "_"
+    return s
+
+
+def _first_tag(tags, keys):
+    """First key whose value sanitizes to something usable. Value-based, not
+    key-based: an empty 'albumartist' must not shadow a valid 'artist'."""
+    for key in keys:
+        try:
+            values = tags.get(key)
+            if not values:
+                continue
+            # str() is uniform across the value types involved: list[str],
+            # ID3 TextFrame, ASFUnicodeAttribute, APETextValue.
+            component = _safe_component(values[0])
+        except Exception:
+            continue
+        if component:
+            return component
+    return None
+
+
+def audio_tags(path):
+    """(artist, album) from music tags, sanitized as folder names.
+    (None, None) without mutagen, without readable tags, or on any error —
+    like exif_date(), nothing here may ever raise."""
+    if not _MUTAGEN_OK:
+        return None, None
+    try:
+        audio = mutagen.File(path, easy=True)
+        if audio is None or not audio.tags:
+            return None, None
+        return _first_tag(audio.tags, _ARTIST_KEYS), _first_tag(audio.tags, _ALBUM_KEYS)
+    except Exception:
+        return None, None
 
 # ---------------------------------------------------------------------------
 # HASHING (3-phase dedup)
@@ -224,6 +343,15 @@ def dest_for(path, input_root, output_root):
     if ext in VIDEO_EXTS:
         dt = file_date(path, is_photo=False)
         return os.path.join(output_root, "Media", "Videos",
+                            "%04d" % dt.year, "%02d" % dt.month, name)
+    if ext in AUDIO_EXTS:
+        artist, album = audio_tags(path)        # (None, None) without mutagen
+        if artist:
+            parts = ["Media", "Music", artist] + ([album] if album else []) + [name]
+            return os.path.join(output_root, *parts)
+        # Untagged audio (voice notes, WhatsApp...): by date, like photos
+        dt = file_date(path, is_photo=False)
+        return os.path.join(output_root, "Media", "Audio",
                             "%04d" % dt.year, "%02d" % dt.month, name)
     if ext in FILE_EXTS:
         return os.path.join(output_root, "Files", ext, name)
@@ -405,10 +533,15 @@ def main():
     verb = "MOVE" if args.move else "COPY"
 
     if not _PIL_OK:
-        print("NOTE: Pillow is not installed; photos will be dated by modification")
-        print("      time instead of EXIF. For EXIF support: pip3 install Pillow\n")
+        print("NOTE: Pillow is not installed; photos will be dated by WhatsApp filename")
+        print("      date or modification time instead of EXIF. For EXIF support:")
+        print("      pip3 install Pillow\n")
     elif not _HEIF_OK:
-        print("NOTE: without pillow-heif, HEIC/HEIF files are dated by mtime.\n")
+        print("NOTE: without pillow-heif, HEIC/HEIF files are dated by filename/mtime.\n")
+    if not _MUTAGEN_OK:
+        print("NOTE: mutagen is not installed; music cannot be classified by artist/album")
+        print("      and ALL audio goes to Media/Audio/ by date. For tag support:")
+        print("      pip3 install mutagen   (on Python <= 3.7, pin mutagen==1.45.1)\n")
 
     warnings = defaultdict(int)
 
