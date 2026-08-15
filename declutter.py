@@ -84,6 +84,12 @@ EXCLUDED_DIRS = {
     "$RECYCLE.BIN", "System Volume Information",      # Windows
 }
 
+# OS metadata files (Finder, Explorer, KDE...) that make a folder look empty
+# in the file manager while blocking rmdir. --clean-empty-dirs deletes them,
+# but ONLY when they are all that remains in the folder: a ._* sidecar next
+# to a file that stayed behind still holds that file's metadata.
+_JUNK_FILES = re.compile(r"(?i)^(?:\.DS_Store|\._.+|Thumbs\.db|desktop\.ini|\.directory)$")
+
 CHUNK = 1024 * 1024          # bytes per read when hashing
 PARTIAL_BYTES = 64 * 1024    # bytes hashed in the partial pass
 
@@ -611,7 +617,8 @@ def main():
     ap.add_argument("--report", default=None,
                     help="CSV report path (with --dry-run, also writes the report)")
     ap.add_argument("--clean-empty-dirs", action="store_true",
-                    help="With --move: remove folders left empty in the inputs")
+                    help="With --move: remove empty folder trees left in the inputs "
+                         "(folders holding only OS junk like .DS_Store count as empty)")
     ap.add_argument("--skip-space-check", action="store_true",
                     help="Do not abort even if the destination seems short on space")
     args = ap.parse_args()
@@ -769,17 +776,28 @@ def main():
 
     # --- Remove empty folders after moving ---
     if args.clean_empty_dirs and args.move and not args.dry_run:
-        removed = 0
+        removed = junk = 0
         for root in inputs:
             for dirpath, _dirs, _files in os.walk(root, topdown=False):
                 if dirpath == root:
                     continue
                 try:
+                    # Fresh listing: the walk snapshot predates child removals
+                    entries = os.listdir(dirpath)
+                    if entries and all(_JUNK_FILES.match(e) for e in entries):
+                        # Only OS metadata left: empty to the user, and the
+                        # junk is orphaned now that the real files moved out.
+                        # Anything else in the folder protects everything.
+                        for entry in entries:
+                            os.unlink(os.path.join(dirpath, entry))
+                        junk += len(entries)
                     os.rmdir(dirpath)   # only removes empty dirs; otherwise fails and is ignored
                     removed += 1
                 except OSError:
                     pass
         print("Empty folders removed from inputs: %d" % removed)
+        if junk:
+            print("OS metadata files removed with them: %d (.DS_Store, ._*, Thumbs.db...)" % junk)
 
     print("\n--- SUMMARY ---")
     print("Unique files %s: %d"

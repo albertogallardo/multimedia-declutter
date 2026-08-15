@@ -111,7 +111,7 @@ python3 declutter.py -i INPUT [-i INPUT2 …] (-o OUTPUT | -d DUPES_DIR | both) 
 | `--dry-run` | Simulation: prints every action (`[DRY-RUN] …`) without touching anything. Does not create the output |
 | `--report PATH` | CSV report path. Without it, the report goes to `duplicates_report.csv` under the output (or under `-d` in extract-only mode). **With `--dry-run` this is the only way to get the CSV** |
 | `--skip-duplicates` | Do not relocate duplicates; only record them in the CSV. Combined with `-d` alone, a pure scan+report audit |
-| `--clean-empty-dirs` | Only with `--move`: afterwards, remove folders left empty in the inputs (never the input root itself, and only if truly empty) |
+| `--clean-empty-dirs` | Only with `--move`: afterwards, recursively remove empty folder trees left in the inputs (never the input root itself). Folders whose only remaining content is OS metadata junk (`.DS_Store`, `._*` AppleDouble sidecars, `Thumbs.db`, `desktop.ini`, `.directory`) count as empty and the junk is deleted with them — the only case where anything is ever deleted. Any other file, hidden or not, protects its folder |
 | `--skip-space-check` | Skip the upfront free-space check at the destination (copy mode). With `-o` and `-d` on different volumes the check only measures the output's volume, so it is approximate |
 
 ---
