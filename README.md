@@ -6,14 +6,16 @@
 
 By design it is **non-destructive**: it copies by default, sets duplicate copies aside in a `Duplicates/` folder for review, and has a dry-run mode that doesn't touch a single file.
 
+It can also run in **extract-only mode** (`-d` without `-o`): deduplicate a folder against itself, setting only the duplicates aside in a folder of your choice, without reorganizing or touching the originals (see [§Extract-only mode](#extract-only-mode)).
+
 ---
 
 ## What it does
 
 1. **Scans** the input folders recursively (one or more).
 2. **Detects duplicates by content** with SHA-256 in 3 phases (see [§How duplicates are detected](#how-duplicates-are-detected)), across all inputs.
-3. **Keeps a single copy** of each file (the one with the oldest modification time) and places it in the output structure.
-4. **Sets the extra copies aside** in `Duplicates/`, preserving their original path so you can audit where each one came from.
+3. **Keeps a single copy** of each file (the one with the oldest modification time) and places it in the output structure — or leaves it where it is, in extract-only mode.
+4. **Sets the extra copies aside** in `Duplicates/` (or the folder given with `-d`), preserving their original path so you can audit where each one came from.
 5. **Writes a CSV report** of what is a duplicate of what, and where the kept original ended up.
 
 ---
@@ -45,7 +47,7 @@ python3 declutter.py -i /path/to/messy-folder -o /path/to/organized \
     --move --clean-empty-dirs
 ```
 
-> The output folder **cannot be inside an input** (or vice versa). The script checks and aborts with a clear error if they overlap, because running that way re-ingests its own output and multiplies files.
+> The output folder **cannot be inside an input** (or vice versa), and the same goes for the duplicates folder given with `-d`. The script checks and aborts with a clear error if they overlap, because running that way re-ingests its own output and multiplies files.
 
 ---
 
@@ -68,7 +70,8 @@ Everything hangs from the folder given with `-o`:
 └── duplicates_report.csv               # (or the path given with --report)
 ```
 
-- **`<input>`** is the name of the input folder the file came from. With several inputs, you always know the origin of every duplicate or "odd" file.
+- **`<input>`** is the name of the input folder the file came from. With several inputs, you always know the origin of every duplicate or "odd" file. Two inputs with the same folder name (`/a/Photos` and `/b/Photos`) get distinct labels: `Photos` and `Photos_2`.
+- With `-d/--duplicates-to`, the `Duplicates/` tree lives at that path instead of inside the output.
 - Unrecognized types and duplicates **keep their original relative path**; recognized photos, videos and files are reorganized by date/extension.
 - **Name collisions** with different content (two different `IMG_001.jpg` landing in the same folder): both are kept, adding a `_1`, `_2`… suffix. Nothing is ever overwritten. Dry-run simulates these renames too.
 
@@ -96,19 +99,40 @@ Any other extension (or files without one) → `Files/other/…`. Note that `m4b
 ## Usage
 
 ```
-python3 declutter.py -i INPUT [-i INPUT2 …] -o OUTPUT [options]
+python3 declutter.py -i INPUT [-i INPUT2 …] (-o OUTPUT | -d DUPES_DIR | both) [options]
 ```
 
 | Option | Effect |
 |---|---|
 | `-i, --input PATH` | Input folder. **Repeatable** to process several at once (deduplication runs across all of them). Required |
-| `-o, --output PATH` | Output root folder. Required. Must not overlap with the inputs |
+| `-o, --output PATH` | Output root folder. Required unless `-d` is given. Must not overlap with the inputs |
+| `-d, --duplicates-to PATH` | Folder where duplicates are set aside. With `-o`, replaces the default `<output>/Duplicates`. Alone (without `-o`): [extract-only mode](#extract-only-mode). Must not overlap with the inputs |
 | `--move` | **Move** instead of copy. Within the same volume this is an instant rename |
 | `--dry-run` | Simulation: prints every action (`[DRY-RUN] …`) without touching anything. Does not create the output |
-| `--report PATH` | CSV report path. Without it, the report goes to `<output>/duplicates_report.csv`. **With `--dry-run` this is the only way to get the CSV** |
-| `--skip-duplicates` | Do not relocate duplicates to `Duplicates/`; only record them in the CSV. Essential for incremental re-runs in copy mode (see [§Re-runs](#re-runs-resuming-and-incremental-passes)) |
+| `--report PATH` | CSV report path. Without it, the report goes to `duplicates_report.csv` under the output (or under `-d` in extract-only mode). **With `--dry-run` this is the only way to get the CSV** |
+| `--skip-duplicates` | Do not relocate duplicates; only record them in the CSV. Essential for incremental re-runs in copy mode (see [§Re-runs](#re-runs-resuming-and-incremental-passes)); combined with `-d` alone, a pure scan+report audit |
 | `--clean-empty-dirs` | Only with `--move`: afterwards, remove folders left empty in the inputs (never the input root itself, and only if truly empty) |
-| `--skip-space-check` | Skip the upfront free-space check at the destination (copy mode) |
+| `--skip-space-check` | Skip the upfront free-space check at the destination (copy mode). With `-o` and `-d` on different volumes the check only measures the output's volume, so it is approximate |
+
+---
+
+## Extract-only mode
+
+`-d` without `-o` deduplicates the inputs **in place**: nothing is reorganized, the kept originals stay exactly where they are, and only the redundant copies are set aside under `<dupes_dir>/<input>/<relative_path>/`.
+
+```bash
+# 1) Preview what would be extracted
+python3 declutter.py -i /share/Media/Photos/FotosDeNavidad -d /share/Media/Duplicates --dry-run
+
+# 2) Extract for real (move the duplicates out)
+python3 declutter.py -i /share/Media/Photos/FotosDeNavidad -d /share/Media/Duplicates --move
+```
+
+- As everywhere else, **copy is the default**: without `--move` the duplicates are copied to the duplicates folder and also remain in the input. Use `--move` to actually extract them.
+- Re-runs are safe in both variants: with `--move` the extracted copies are gone from the input; in copy mode, a duplicate already present at the destination with identical content is not copied again.
+- Copy pass first, `--move` pass later? The move still extracts every duplicate from the input; the ones the copy pass already placed get a `_1` suffix at the destination (redundant but harmless — nothing is ever left behind silently).
+- The CSV report goes to `<dupes_dir>/duplicates_report.csv` by default, and its `original_destination` column equals `kept_original` (originals are not relocated in this mode).
+- `--skip-duplicates` combined with `-d` alone turns the run into a pure census: scan, report, touch nothing.
 
 ---
 
@@ -180,7 +204,7 @@ UTF-8 encoded, one row per detected duplicate:
 |---|---|
 | `duplicate` | Original path of the redundant file (where it was in the input) |
 | `kept_original` | Input path of the copy that was kept |
-| `original_destination` | Where that kept original was placed in the output (especially useful after `--move`, when the input path no longer exists) |
+| `original_destination` | Where that kept original was placed in the output (especially useful after `--move`, when the input path no longer exists). In extract-only mode originals are not relocated, so this equals `kept_original` |
 | `sha256` | Content hash (identical for the whole pair/group) |
 
 Filenames with non-UTF-8 bytes appear with escape sequences instead of breaking the report.
@@ -195,6 +219,7 @@ The script is **resumable and idempotent**: if a file already exists at its dest
 - **Resuming or repeating with `--move`**: naturally clean — whatever was already moved is no longer in the input.
 - **Resuming or repeating in copy mode**: add `--skip-duplicates`. Otherwise everything already placed by the previous pass would count as a "duplicate of the destination" and be physically copied into `Duplicates/`, bloating it for no reason.
 - **Incremental passes** (feeding new folders into the same output over time): same advice — in copy mode use `--skip-duplicates`; with `--move` it's not needed.
+- **Extract-only mode** is idempotent on its own: duplicates already extracted (moved out, or copied with identical content at the destination) are not extracted again.
 
 > ⚠️ **Upgrading from a version without audio support**: older versions placed mp3/flac/m4a/wav/ogg
 > under `Files/<ext>/` and every other now-recognized audio extension (opus, oga, aac, wma, aiff,
@@ -213,7 +238,7 @@ The script is **resumable and idempotent**: if a file already exists at its dest
 
 ## Built-in safeguards
 
-- **Input/output overlap**: aborts before starting (exit code 2) with an explanation.
+- **Input/output overlap**: aborts before starting (exit code 2) with an explanation. The duplicates folder given with `-d` gets the same check.
 - **Repeated or nested inputs**: deduplicated with a warning (prevents files being flagged as "duplicates of themselves").
 - **Space check** (copy mode): before touching anything, estimates the total to copy and aborts if the destination lacks that space +2% margin, suggesting alternatives (`--move`, freeing space, or `--skip-space-check`).
 - **Disk full mid-run (ENOSPC)**: stops dead (exit code 3) instead of failing file by file for hours. Free some space, re-run, and it resumes.
@@ -303,6 +328,13 @@ python3 declutter.py -i /data/new-batch -o /data/organized --skip-duplicates
 
 # Just a duplicate census, without organizing anything yet
 python3 declutter.py -i /data/messy -o /data/organized --dry-run --report /tmp/census.csv
+
+# Extract-only: preview, then move ONLY the duplicates out, originals untouched
+python3 declutter.py -i /share/Media/Photos/FotosDeNavidad -d /share/Media/Duplicates --dry-run
+python3 declutter.py -i /share/Media/Photos/FotosDeNavidad -d /share/Media/Duplicates --move
+
+# Organize as usual, but keep the duplicates quarantine on another disk
+python3 declutter.py -i /data/messy -o /data/organized -d /mnt/backup/dupes --move
 ```
 
 ---

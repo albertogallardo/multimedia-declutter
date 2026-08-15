@@ -17,6 +17,11 @@ Duplicates are detected by CONTENT (size -> partial SHA-256 -> full SHA-256),
 never by name. Nothing is ever deleted: files are copied by default and extra
 copies are set aside in Duplicates/ for manual review.
 
+With -d/--duplicates-to, the extra copies go to that folder instead of
+<output>/Duplicates. Used alone (without -o) nothing is reorganized: the
+originals stay where they are and only the duplicates are copied (or moved
+with --move) there — extract-only mode.
+
 No required dependencies. With Pillow installed, photos are dated from EXIF;
 with pillow-heif, HEIC/HEIF (iPhone) files are too. With mutagen, music is
 classified by artist/album; without it, all audio is filed by date.
@@ -25,6 +30,10 @@ Recommended usage:
   1) python3 declutter.py -i /path/to/messy -o /path/to/organized --dry-run --report /tmp/report.csv
   2) review the report and the simulation
   3) python3 declutter.py -i /path/to/messy -o /path/to/organized --move --clean-empty-dirs
+
+Extract-only (deduplicate a folder in place, originals untouched):
+  python3 declutter.py -i /path/to/folder -d /path/to/duplicates --dry-run
+  python3 declutter.py -i /path/to/folder -d /path/to/duplicates --move
 """
 
 import argparse
@@ -291,10 +300,10 @@ def _is_within(child, parent):
         return False
 
 
-def validate_paths(inputs, output):
-    """Reject overlapping input/output (each run would re-ingest its own
-    output) and drop repeated or nested inputs (their files would be flagged
-    as duplicates of themselves)."""
+def validate_paths(inputs, output, duplicates_to):
+    """Reject overlapping input/destination folders (each run would re-ingest
+    its own output) and drop repeated or nested inputs (their files would be
+    flagged as duplicates of themselves)."""
     cleaned = []
     for r in inputs:
         rp = os.path.realpath(r)
@@ -304,7 +313,9 @@ def validate_paths(inputs, output):
         cleaned.append(rp)
 
     final = []
-    for r in sorted(set(cleaned), key=len):
+    # Lexical tie-break: equal-length roots must keep a stable order so the
+    # source labels (Photos, Photos_2...) never swap between runs.
+    for r in sorted(set(cleaned), key=lambda p: (len(p), p)):
         if any(_is_within(r, prev) for prev in final):
             print("WARNING: '%s' is inside another input; skipping it to avoid processing it twice." % r)
             continue
@@ -314,24 +325,45 @@ def validate_paths(inputs, output):
         print("ERROR: no valid input folder.", file=sys.stderr)
         sys.exit(2)
 
-    output_root = os.path.realpath(output)
-    if os.path.exists(output_root) and not os.path.isdir(output_root):
-        print("ERROR: output exists and is not a folder: %s" % output_root, file=sys.stderr)
-        sys.exit(2)
-    for r in final:
-        if _is_within(output_root, r) or _is_within(r, output_root):
-            print("ERROR: input and output overlap:\n  input:  %s\n  output: %s\n"
-                  "Running like this re-ingests the output and multiplies files. "
-                  "Use an output folder outside the inputs." % (r, output_root), file=sys.stderr)
+    output_root = os.path.realpath(output) if output else None
+    dup_root = os.path.realpath(duplicates_to) if duplicates_to else None
+    for what, root_path in (("output", output_root), ("duplicates destination", dup_root)):
+        if root_path is None:
+            continue
+        if os.path.exists(root_path) and not os.path.isdir(root_path):
+            print("ERROR: %s exists and is not a folder: %s" % (what, root_path), file=sys.stderr)
             sys.exit(2)
+        for r in final:
+            if _is_within(root_path, r) or _is_within(r, root_path):
+                print("ERROR: input and %s overlap:\n  input: %s\n  %s: %s\n"
+                      "Running like this re-ingests it and multiplies files. "
+                      "Use a folder outside the inputs." % (what, r, what, root_path), file=sys.stderr)
+                sys.exit(2)
 
-    return final, output_root
+    return final, output_root, dup_root
 
 # ---------------------------------------------------------------------------
 # CLASSIFICATION AND DESTINATIONS
 # ---------------------------------------------------------------------------
 
-def dest_for(path, input_root, output_root):
+def source_labels(inputs):
+    """Map each input root to a unique <source> folder name for Files/other/
+    and Duplicates/. Two inputs with the same leaf name ('/a/Photos',
+    '/b/Photos') become 'Photos' and 'Photos_2' instead of silently merging."""
+    labels = {}
+    used = set()
+    for root in inputs:
+        base = os.path.basename(os.path.normpath(root)) or "root"
+        label, i = base, 1
+        while label in used:
+            i += 1
+            label = "%s_%d" % (base, i)
+        used.add(label)
+        labels[root] = label
+    return labels
+
+
+def dest_for(path, input_root, output_root, labels):
     """Destination path based on file type and date."""
     name = os.path.basename(path)
     ext = os.path.splitext(name)[1].lstrip(".").lower()
@@ -360,7 +392,7 @@ def dest_for(path, input_root, output_root):
     rel_dir = os.path.relpath(os.path.dirname(path), input_root)
     if rel_dir == ".":
         rel_dir = ""
-    source = os.path.basename(os.path.normpath(input_root))
+    source = labels[input_root]
     return os.path.join(output_root, "Files", "other", source, rel_dir, name)
 
 
@@ -506,11 +538,17 @@ def main():
         description="Organize files by type/date and detect real duplicates (by content).")
     ap.add_argument("-i", "--input", action="append", required=True,
                     help="Input folder (repeatable)")
-    ap.add_argument("-o", "--output", required=True, help="Output root folder")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Output root folder (organizes originals). Optional if -d is given")
+    ap.add_argument("-d", "--duplicates-to", default=None, metavar="PATH",
+                    help="Folder where duplicates are set aside. With -o, replaces the "
+                         "default <output>/Duplicates. Alone (without -o): extract-only "
+                         "mode - originals stay untouched and only the duplicates are "
+                         "copied (or moved with --move) there")
     ap.add_argument("--move", action="store_true", help="Move instead of copy")
     ap.add_argument("--dry-run", action="store_true", help="Simulate: touch nothing")
     ap.add_argument("--skip-duplicates", action="store_true",
-                    help="Do not relocate duplicates to Duplicates/, only record them in the CSV")
+                    help="Do not relocate duplicates, only record them in the CSV")
     ap.add_argument("--report", default=None,
                     help="CSV report path (with --dry-run, also writes the report)")
     ap.add_argument("--clean-empty-dirs", action="store_true",
@@ -518,6 +556,8 @@ def main():
     ap.add_argument("--skip-space-check", action="store_true",
                     help="Do not abort even if the destination seems short on space")
     args = ap.parse_args()
+    if not args.output and not args.duplicates_to:
+        ap.error("at least one of -o/--output or -d/--duplicates-to is required")
 
     # Odd filenames must not crash console output on strict-encoding terminals
     for stream in (sys.stdout, sys.stderr):
@@ -527,10 +567,20 @@ def main():
             except Exception:
                 pass
 
-    inputs, output_root = validate_paths(args.input, args.output)
-    report_path = os.path.realpath(args.report) if args.report else os.path.join(output_root, "duplicates_report.csv")
+    inputs, output_root, dup_root = validate_paths(args.input, args.output, args.duplicates_to)
+    extract_only = output_root is None
+    if dup_root is None:
+        dup_root = os.path.join(output_root, "Duplicates")
+    labels = source_labels(inputs)
+    report_path = os.path.realpath(args.report) if args.report else \
+        os.path.join(output_root or dup_root, "duplicates_report.csv")
     action = shutil.move if args.move else shutil.copy2
     verb = "MOVE" if args.move else "COPY"
+
+    if extract_only:
+        print("NOTE: extract-only mode (-d without -o): originals stay in place;")
+        print("      duplicates are %s to %s\n"
+              % ("MOVED" if args.move else "COPIED", dup_root))
 
     if not _PIL_OK:
         print("NOTE: Pillow is not installed; photos will be dated by WhatsApp filename")
@@ -556,20 +606,22 @@ def main():
     # Space check before touching anything (copy mode only)
     if not args.move and not args.dry_run and not args.skip_space_check:
         needed = 0
-        for path, _root, _h in originals:
-            try:
-                needed += os.path.getsize(path)
-            except OSError:
-                pass
+        if not extract_only:
+            for path, _root, _h in originals:
+                try:
+                    needed += os.path.getsize(path)
+                except OSError:
+                    pass
         if not args.skip_duplicates:
             for dup, _r, _o, _h in duplicates:
                 try:
                     needed += os.path.getsize(dup)
                 except OSError:
                     pass
+        space_root = dup_root if extract_only else output_root
         try:
-            os.makedirs(output_root, exist_ok=True)
-            free = shutil.disk_usage(output_root).free
+            os.makedirs(space_root, exist_ok=True)
+            free = shutil.disk_usage(space_root).free
         except OSError:
             free = None
         if free is not None and free < needed * 1.02:
@@ -584,12 +636,13 @@ def main():
     reserved = set()   # destinations already assigned in this run
     dest_map = {}      # original -> final destination (for the report)
     count = 0
-    for path, root, h in originals:
+    to_place = [] if extract_only else originals   # extract-only: leave originals alone
+    for path, root, h in to_place:
         count += 1
         if count % 1000 == 0:
-            print("  ... processing %d/%d" % (count, len(originals)), flush=True)
+            print("  ... processing %d/%d" % (count, len(to_place)), flush=True)
 
-        dest = dest_for(path, root, output_root)
+        dest = dest_for(path, root, output_root, labels)
         if os.path.exists(dest):
             # Same content already at the destination? (makes re-runs resumable)
             try:
@@ -633,13 +686,23 @@ def main():
     if not args.skip_duplicates:
         for dup, root, orig, h in duplicates:
             rel = os.path.relpath(dup, root)
-            dest = os.path.join(output_root, "Duplicates", os.path.basename(os.path.normpath(root)), rel)
+            dest = os.path.join(dup_root, labels[root], rel)
+            # Copy mode only: with --move the duplicate must always leave the
+            # input, even if an identical copy already sits at the destination
+            if not args.move and os.path.exists(dest):
+                # Same content already set aside? (makes copy-mode re-runs resumable)
+                try:
+                    if os.path.getsize(dest) == os.path.getsize(dup) and full_hash(dest) == h:
+                        continue
+                except OSError:
+                    pass
+            dest = unique_path(dest, reserved)
             if args.dry_run:
                 print("[DRY-RUN] duplicate: %s (== %s) -> %s" % (dup, orig, dest))
             else:
                 try:
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    action(dup, unique_path(dest, reserved))
+                    action(dup, dest)
                 except (OSError, shutil.Error) as e:
                     if getattr(e, "errno", None) == errno.ENOSPC:
                         _abort_disk_full()
@@ -661,7 +724,8 @@ def main():
         print("Empty folders removed from inputs: %d" % removed)
 
     print("\n--- SUMMARY ---")
-    print("Unique files processed: %d" % len(originals))
+    print("Unique files %s: %d"
+          % ("kept in place" if extract_only else "processed", len(originals)))
     print("Duplicates detected:    %d" % len(duplicates))
     if warnings["symlinks"]:
         print("Symlinks skipped:       %d" % warnings["symlinks"])
