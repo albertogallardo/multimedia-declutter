@@ -110,7 +110,7 @@ python3 declutter.py -i INPUT [-i INPUT2 …] (-o OUTPUT | -d DUPES_DIR | both) 
 | `--move` | **Move** instead of copy. Within the same volume this is an instant rename |
 | `--dry-run` | Simulation: prints every action (`[DRY-RUN] …`) without touching anything. Does not create the output |
 | `--report PATH` | CSV report path. Without it, the report goes to `duplicates_report.csv` under the output (or under `-d` in extract-only mode). **With `--dry-run` this is the only way to get the CSV** |
-| `--skip-duplicates` | Do not relocate duplicates; only record them in the CSV. Essential for incremental re-runs in copy mode (see [§Re-runs](#re-runs-resuming-and-incremental-passes)); combined with `-d` alone, a pure scan+report audit |
+| `--skip-duplicates` | Do not relocate duplicates; only record them in the CSV. Combined with `-d` alone, a pure scan+report audit |
 | `--clean-empty-dirs` | Only with `--move`: afterwards, remove folders left empty in the inputs (never the input root itself, and only if truly empty) |
 | `--skip-space-check` | Skip the upfront free-space check at the destination (copy mode). With `-o` and `-d` on different volumes the check only measures the output's volume, so it is approximate |
 
@@ -213,12 +213,12 @@ Filenames with non-UTF-8 bytes appear with escape sequences instead of breaking 
 
 ## Re-runs, resuming and incremental passes
 
-The script is **resumable and idempotent**: if a file already exists at its destination with identical content, it is not copied or renamed again; it is recorded as a duplicate of the destination.
+The script is **resumable and idempotent**: if a file's content already sits at its destination — even under a collision-renamed name (`x_1.jpg`) — it is not copied again. In copy mode it is simply skipped and counted in the summary (`Already at destination`); with `--move` the source is still set aside into `Duplicates/`, so it always leaves the input.
 
-- **Interrupted (Ctrl+C) or disk full**: re-run the same command and it picks up where it left off, without overwriting anything.
+- **Interrupted (Ctrl+C) or disk full**: re-run the same command and it picks up where it left off, without overwriting anything. Every transfer lands under a temporary `.part` name and is renamed into place only when complete, so an interruption can never leave a truncated file under a real name (at most a stray `.part` file after a power loss, easy to spot and delete).
 - **Resuming or repeating with `--move`**: naturally clean — whatever was already moved is no longer in the input.
-- **Resuming or repeating in copy mode**: add `--skip-duplicates`. Otherwise everything already placed by the previous pass would count as a "duplicate of the destination" and be physically copied into `Duplicates/`, bloating it for no reason.
-- **Incremental passes** (feeding new folders into the same output over time): same advice — in copy mode use `--skip-duplicates`; with `--move` it's not needed.
+- **Resuming or repeating in copy mode**: safe as-is — already-placed files are skipped, not treated as duplicates, and nothing is re-copied into `Duplicates/`.
+- **Incremental passes** (feeding new folders into the same output over time): same — content already placed is recognized and skipped in copy mode; with `--move` it is already gone from the input.
 - **Extract-only mode** is idempotent on its own: duplicates already extracted (moved out, or copied with identical content at the destination) are not extracted again.
 
 > ⚠️ **Upgrading from a version without audio support**: older versions placed mp3/flac/m4a/wav/ogg
@@ -242,9 +242,10 @@ The script is **resumable and idempotent**: if a file already exists at its dest
 - **Repeated or nested inputs**: deduplicated with a warning (prevents files being flagged as "duplicates of themselves").
 - **Space check** (copy mode): before touching anything, estimates the total to copy and aborts if the destination lacks that space +2% margin, suggesting alternatives (`--move`, freeing space, or `--skip-space-check`).
 - **Disk full mid-run (ENOSPC)**: stops dead (exit code 3) instead of failing file by file for hours. Free some space, re-run, and it resumes.
+- **No partial files**: copies and cross-volume moves write to a temporary `.part` sibling and rename into place once complete, so an interrupted run never leaves a truncated file under a real name.
 - **Non-UTF-8 filenames**: neither the console nor the CSV crash (output uses replacement/escapes).
 - **Unreadable folders** (permissions): reported on stderr and counted in the summary instead of being silently skipped.
-- **Final summary** with counters: unique files processed, duplicates, symlinks skipped, special files skipped, unreadable items and errors.
+- **Final summary** with counters: unique files processed, duplicates, files already placed by a previous run, symlinks skipped, special files skipped, unreadable items and errors.
 
 ---
 

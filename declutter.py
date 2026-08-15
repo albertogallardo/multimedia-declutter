@@ -408,6 +408,65 @@ def unique_path(dest, reserved):
     reserved.add(candidate)
     return candidate
 
+
+def find_slot(dest, src, h, reserved):
+    """Content-aware unique_path: walk dest, dest_1, dest_2... and stop early
+    if a candidate already holds src's exact content — a previous run placed
+    this file there, possibly under a collision-renamed name, so re-runs must
+    recognize it instead of copying yet another _N. Candidates reserved by
+    THIS run belong to other source files and are skipped without comparing.
+    Returns (path, full_hash_or_None, already_placed)."""
+    base, ext = os.path.splitext(dest)
+    try:
+        src_size = os.path.getsize(src)
+    except OSError:
+        src_size = None
+    candidate, i, h_src = dest, 1, h
+    while True:
+        if candidate not in reserved:
+            if not os.path.exists(candidate):
+                reserved.add(candidate)
+                return candidate, h_src, False
+            try:
+                if src_size is not None and os.path.getsize(candidate) == src_size:
+                    h_src = h_src or full_hash(src)
+                    if full_hash(candidate) == h_src:
+                        return candidate, h_src, True
+            except OSError:
+                pass
+        candidate = "%s_%d%s" % (base, i, ext)
+        i += 1
+
+
+def transfer(src, dest, move):
+    """Copy or move src to dest without ever exposing a partial file at the
+    final name: bytes land in a '.part' sibling first, then an atomic rename.
+    Otherwise an interrupted transfer leaves a truncated file at the real
+    name, which re-runs would route around (name_1) while the corrupt copy
+    kept the canonical name forever."""
+    if move:
+        try:
+            os.rename(src, dest)   # same volume: atomic, nothing partial
+            return
+        except OSError:
+            pass                   # cross-device (EXDEV) etc.: copy + unlink
+    tmp = "%s.part" % dest
+    i = 1
+    while os.path.exists(tmp):     # never overwrite a name something else owns
+        tmp = "%s.part%d" % (dest, i)
+        i += 1
+    try:
+        shutil.copy2(src, tmp)
+        os.rename(tmp, dest)
+    except BaseException:          # incl. KeyboardInterrupt mid-copy
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if move:
+        os.unlink(src)             # only after the copy fully landed
+
 # ---------------------------------------------------------------------------
 # SCANNING
 # ---------------------------------------------------------------------------
@@ -574,7 +633,6 @@ def main():
     labels = source_labels(inputs)
     report_path = os.path.realpath(args.report) if args.report else \
         os.path.join(output_root or dup_root, "duplicates_report.csv")
-    action = shutil.move if args.move else shutil.copy2
     verb = "MOVE" if args.move else "COPY"
 
     if extract_only:
@@ -633,8 +691,9 @@ def main():
 
     # --- Place originals ---
     errors = 0
-    reserved = set()   # destinations already assigned in this run
-    dest_map = {}      # original -> final destination (for the report)
+    reserved = set()      # destinations already assigned in this run
+    dest_map = {}         # original -> final destination (for the report)
+    already_placed = 0    # skipped because a previous run already placed them
     count = 0
     to_place = [] if extract_only else originals   # extract-only: leave originals alone
     for path, root, h in to_place:
@@ -642,26 +701,27 @@ def main():
         if count % 1000 == 0:
             print("  ... processing %d/%d" % (count, len(to_place)), flush=True)
 
-        dest = dest_for(path, root, output_root, labels)
-        if os.path.exists(dest):
-            # Same content already at the destination? (makes re-runs resumable)
-            try:
-                if os.path.getsize(dest) == os.path.getsize(path):
-                    h_src = h or full_hash(path)
-                    if full_hash(dest) == h_src:
-                        duplicates.append((path, root, dest, h_src))
-                        continue
-            except OSError:
-                pass
-        dest = unique_path(dest, reserved)
+        dest, h_src, already = find_slot(
+            dest_for(path, root, output_root, labels), path, h, reserved)
         dest_map[path] = dest
+        if already:
+            # A previous run already placed this exact content (re-runs are
+            # resumable). In copy mode the source is what that run copied
+            # FROM, not a new duplicate — relocating it would re-copy the
+            # whole input into Duplicates/ on every re-run. With --move the
+            # source must still leave the input, so set it aside as one.
+            if args.move:
+                duplicates.append((path, root, dest, h_src))
+            else:
+                already_placed += 1
+            continue
 
         if args.dry_run:
             print("[DRY-RUN] %s: %s -> %s" % (verb, path, dest))
         else:
             try:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
-                action(path, dest)
+                transfer(path, dest, args.move)
             except (OSError, shutil.Error) as e:
                 if getattr(e, "errno", None) == errno.ENOSPC:
                     _abort_disk_full()
@@ -689,20 +749,18 @@ def main():
             dest = os.path.join(dup_root, labels[root], rel)
             # Copy mode only: with --move the duplicate must always leave the
             # input, even if an identical copy already sits at the destination
-            if not args.move and os.path.exists(dest):
-                # Same content already set aside? (makes copy-mode re-runs resumable)
-                try:
-                    if os.path.getsize(dest) == os.path.getsize(dup) and full_hash(dest) == h:
-                        continue
-                except OSError:
-                    pass
-            dest = unique_path(dest, reserved)
+            if not args.move:
+                dest, _h, already = find_slot(dest, dup, h, reserved)
+                if already:
+                    continue    # already set aside by a previous run
+            else:
+                dest = unique_path(dest, reserved)
             if args.dry_run:
                 print("[DRY-RUN] duplicate: %s (== %s) -> %s" % (dup, orig, dest))
             else:
                 try:
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    action(dup, dest)
+                    transfer(dup, dest, args.move)
                 except (OSError, shutil.Error) as e:
                     if getattr(e, "errno", None) == errno.ENOSPC:
                         _abort_disk_full()
@@ -727,6 +785,9 @@ def main():
     print("Unique files %s: %d"
           % ("kept in place" if extract_only else "processed", len(originals)))
     print("Duplicates detected:    %d" % len(duplicates))
+    if already_placed:
+        print("Already at destination: %d (placed by a previous run, skipped)"
+              % already_placed)
     if warnings["symlinks"]:
         print("Symlinks skipped:       %d" % warnings["symlinks"])
     if warnings["special"]:
